@@ -1,0 +1,44 @@
+name: Lint
+
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  golangci:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.56.2
+
+          # Optional: golangci-lint command line arguments.
+          # args: --issues-exit-code=0
+
+          # Optional: show only new issues if it's a pull request. The default value is `false`.
+          only-new-issues: true
+
+  checklicenses:
+    name: checklicenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: 
+          go-version: 'stable'
+      - name: check license headers
+        run: |
+          set -exu
+          go get github.com/u-root/u-root/tools/checklicenses
+          go install github.com/u-root/u-root/tools/checklicenses
+          $(go env GOPATH)/bin/checklicenses -c .ci/checklicenses_config.json

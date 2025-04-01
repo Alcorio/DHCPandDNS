@@ -1,0 +1,33 @@
+name: Trivy Nightly Scan
+on:
+  schedule:
+    - cron: '0 2 * * 5'  # Run at 2AM UTC on every Friday
+
+permissions: read-all
+jobs:
+  nightly-scan:
+    name: Trivy Scan nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        # It will test for only the latest version as older version is not maintained
+        versions: [latest]
+    permissions:
+      security-events: write  # for github/codeql-action/upload-sarif to upload SARIF results
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2  # master
+        with:
+          image-ref: 'docker.io/coredns/coredns:${{ matrix.versions }}'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@ea9e4e37992a54ee68a9622e985e60c8e8f12d9f  # v3.27.4
+        with:
+          sarif_file: 'trivy-results.sarif'

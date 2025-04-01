@@ -1,0 +1,96 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.20', '1.21']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # clone in the gopath
+          path: src/github.com/${{ github.repository }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: |
+          # `env` doesn't allow for variable expansion, so we use the GITHUB_ENV
+          # trick.
+          echo "GOPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "GO111MODULE=on" >> $GITHUB_ENV
+      - name: run unit tests
+        run: |
+          cd $GITHUB_WORKSPACE/src/github.com/${{ github.repository }}
+          go get -v -t ./...
+          go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+      - name: report coverage to codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.txt
+          disable_search: true
+          flags: unittests
+          fail_ci_if_error: true
+          verbose: true
+          root_dir: ${{ github.workspace }}/src/github.com/${{ github.repository }}
+          working-directory: ${{ github.workspace }}/src/github.com/${{ github.repository }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  integration-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.20', '1.21']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # clone in the gopath
+          path: src/github.com/${{ github.repository }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: |
+          # `env` doesn't allow for variable expansion, so we use the GITHUB_ENV
+          # trick.
+          echo "GOPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "GO111MODULE=on" >> $GITHUB_ENV
+      - name: setup integ tests
+        run: |
+          cd $GITHUB_WORKSPACE/src/github.com/${{ github.repository }}
+          ./.ci/setup-integ.sh
+      - name: run integ tests
+        env:
+          GOCOVERDIR: ${{github.workspace}}/.cover
+        run: |
+          mkdir $GOCOVERDIR
+          cd $GITHUB_WORKSPACE/src/github.com/${{ github.repository }}
+          go get -v -t -tags=integration ./integ/...
+          for d in integ/*; do
+              pushd "$d"
+              go build -tags=integration -race -cover -coverpkg=github.com/coredhcp/coredhcp/... .
+              testbin=$(basename $d)
+              test -x "${testbin}" || echo "::error file=${d}::missing binary for integration test ${d}"
+              # only run it if it was built - i.e. if there are integ tests
+              test -x "${testbin}" && sudo --preserve-env=GOCOVERDIR "./${testbin}"
+              if [ $? -ne 0 ]; then
+                echo "::error file=${d}::Execution of integration tests for ${d} failed"
+              fi
+              popd
+          done
+          go tool covdata textfmt -i=$GOCOVERDIR -o=coverage.txt
+      - name: report coverage to codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.txt
+          disable_search: true
+          flags: integtests
+          fail_ci_if_error: true
+          verbose: true
+          root_dir: ${{ github.workspace }}/src/github.com/${{ github.repository }}
+          working-directory: ${{ github.workspace }}/src/github.com/${{ github.repository }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

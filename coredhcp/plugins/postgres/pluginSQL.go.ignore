@@ -1,0 +1,198 @@
+// Copyright 2018-present the CoreDHCP Authors. All rights reserved
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+package postgres
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/coredhcp/coredhcp/handler"
+	"github.com/coredhcp/coredhcp/logger"
+	"github.com/coredhcp/coredhcp/plugins"
+	_ "github.com/lib/pq"
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv6"
+)
+
+var (
+	log      = logger.GetLogger("plugins/postgres")
+	db       *sql.DB
+	recLock  sync.RWMutex
+	dbConfig = ""
+)
+
+// Plugin wraps plugin registration information
+var Plugin = plugins.Plugin{
+	Name:   "postgres",
+	Setup6: setup6,
+	Setup4: setup4,
+}
+
+// Handler6 handles DHCPv6 packets for the PostgreSQL plugin
+func Handler6(req, resp dhcpv6.DHCPv6) (dhcpv6.DHCPv6, bool) {
+	m, err := req.GetInnerMessage()
+	if err != nil {
+		log.Errorf("BUG: could not decapsulate request: %v", err)
+		return nil, true
+	}
+
+	if m.Options.OneIANA() == nil {
+		log.Debug("No address requested in the DHCPv6 message")
+		return resp, false
+	}
+
+	mac, err := dhcpv6.ExtractMAC(req)
+	if err != nil {
+		log.Warningf("Failed to extract MAC address: %v", err)
+		return resp, false
+	}
+	log.Debugf("Looking up IPv6 address for MAC %s", mac.String())
+
+	recLock.RLock()
+	ipaddr, err := queryDetailsFromDB(mac.String(), 6)
+	recLock.RUnlock()
+	if err != nil {
+		log.Warningf("MAC address %s not found: %v", mac.String(), err)
+		return resp, false
+	}
+	log.Debugf("Assigned IPv6 address %s to MAC %s", ipaddr.IP, mac.String())
+
+	resp.AddOption(&dhcpv6.OptIANA{
+		IaId: m.Options.OneIANA().IaId,
+		Options: dhcpv6.IdentityOptions{Options: []dhcpv6.Option{
+			&dhcpv6.OptIAAddress{
+				IPv6Addr:          ipaddr.IP,
+				PreferredLifetime: ipaddr.LeaseTime,
+				ValidLifetime:     ipaddr.LeaseTime,
+			},
+		}},
+	})
+	log.Debugf("Added IPv6 IANA option for MAC %s", mac.String())
+	return resp, false
+}
+
+// Handler4 handles DHCPv4 packets for the PostgreSQL plugin
+func Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) {
+	recLock.RLock()
+	details, err := queryDetailsFromDB(req.ClientHWAddr.String(), 4)
+	recLock.RUnlock()
+	if err != nil {
+		log.Warningf("MAC address %s not found in the database: %v", req.ClientHWAddr.String(), err)
+		return resp, false
+	}
+
+	resp.YourIPAddr = details.IP
+	resp.Options.Update(dhcpv4.OptSubnetMask(details.SubnetMask))
+	if details.Router != nil {
+		resp.Options.Update(dhcpv4.OptRouter(details.Router))
+	}
+	if len(details.DNS) > 0 {
+		resp.Options.Update(dhcpv4.OptDNS(details.DNS...))
+	}
+	resp.Options.Update(dhcpv4.OptIPAddressLeaseTime(details.LeaseTime))
+
+	log.Debugf("Assigned IPv4 address %s with details to MAC %s", details.IP, req.ClientHWAddr.String())
+	return resp, true
+}
+
+func setup6(args ...string) (handler.Handler6, error) {
+	log.Debugf("Setting up Handler6 with arguments: %v", args)
+	h6, _, err := setupDB(true, args...)
+	if err != nil {
+		log.Errorf("Failed to set up Handler6: %v", err)
+	}
+	return h6, err
+}
+
+func setup4(args ...string) (handler.Handler4, error) {
+	log.Debugf("Setting up Handler4 with arguments: %v", args)
+	_, h4, err := setupDB(false, args...)
+	if err != nil {
+		log.Errorf("Failed to set up Handler4: %v", err)
+	}
+	return h4, err
+}
+
+func setupDB(v6 bool, args ...string) (handler.Handler6, handler.Handler4, error) {
+	if len(args) < 1 {
+		return nil, nil, errors.New("PostgreSQL connection string required")
+	}
+	log.Debugf("Initializing PostgreSQL database with connection string: %s", args[0])
+	dbConfig = args[0]
+	var err error
+	db, err = sql.Open("postgres", dbConfig)
+	if err != nil {
+		log.Errorf("Failed to open PostgreSQL connection: %v", err)
+		return nil, nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
+	}
+
+	if err = db.Ping(); err != nil {
+		log.Errorf("Failed to ping PostgreSQL: %v", err)
+		return nil, nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
+	}
+
+	log.Infof("Connected to PostgreSQL successfully")
+	return Handler6, Handler4, nil
+}
+
+type IPDetails struct {
+	IP         net.IP
+	SubnetMask net.IPMask
+	Router     net.IP
+	DNS        []net.IP
+	LeaseTime  time.Duration
+}
+
+func queryDetailsFromDB(mac string, version int) (*IPDetails, error) {
+	log.Debugf("Querying details for MAC %s and version %d", mac, version)
+	query := `SELECT ip_address, subnet_mask, router, dns_servers, lease_time 
+		FROM dhcp_leases WHERE mac_address = $1 AND ip_version = $2`
+	var ipStr, maskStr, routerStr, dnsStr string
+	var leaseSeconds int
+	err := db.QueryRow(query, mac, version).Scan(&ipStr, &maskStr, &routerStr, &dnsStr, &leaseSeconds)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			log.Warningf("No record found for MAC %s", mac)
+			return nil, fmt.Errorf("no record found for MAC %s", mac)
+		}
+		log.Errorf("Database query error for MAC %s: %v", mac, err)
+		return nil, fmt.Errorf("query error: %w", err)
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		log.Errorf("Invalid IP address %s retrieved for MAC %s", ipStr, mac)
+		return nil, fmt.Errorf("invalid IP address %s for MAC %s", ipStr, mac)
+	}
+
+	subnetMask := net.IPMask(net.ParseIP(maskStr).To4())
+	var router net.IP
+	if routerStr != "" {
+		router = net.ParseIP(routerStr)
+	}
+
+	var dns []net.IP
+	if dnsStr != "" {
+		for _, dnsIP := range strings.Split(dnsStr, ",") {
+			parsedDNS := net.ParseIP(dnsIP)
+			if parsedDNS != nil {
+				dns = append(dns, parsedDNS)
+			}
+		}
+	}
+
+	return &IPDetails{
+		IP:         ip,
+		SubnetMask: subnetMask,
+		Router:     router,
+		DNS:        dns,
+		LeaseTime:  time.Duration(leaseSeconds) * time.Second,
+	}, nil
+}
